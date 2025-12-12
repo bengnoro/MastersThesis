@@ -4,3 +4,7 @@
 /test_spec.png
 /audiocaps_raw_audio/
 
+/generated_samples/
+/SpeechCommands/
+/training_logs/
+/sounds/
