@@ -6,11 +6,9 @@ import matplotlib.pyplot as plt
 import os
 import warnings
 
-# Suppress harmless HuggingFace warnings and multiprocessing deadlocks
 os.environ["TOKENIZERS_PARALLELISM"] = "false"
 os.environ["HF_HUB_DISABLE_SYMLINKS_WARNING"] = "1"
 warnings.filterwarnings("ignore", category=FutureWarning)
-
 from data_pipeline import (
     AudioTextDataset, collate_fn, N_MELS, TARGET_TIME_STEPS,
     EMBEDDING_DIM as TEXT_EMBEDDING_DIM, SAMPLE_RATE, N_FFT, HOP_LENGTH,
@@ -19,16 +17,14 @@ from data_pipeline import (
 from models import Generator, Discriminator, initialize_weights, NOISE_DIM
 from sentence_transformers import SentenceTransformer
 
-# Hyperparameters
 LEARNING_RATE = 1e-4
-# Reduced batch size to safely fit 16GB VRAM with SA-ResGAN
 BATCH_SIZE = 32
 Z_DIM = NOISE_DIM
 FEATURES_CRITIC = 64
 FEATURES_GEN = 512
 CRITIC_ITERATIONS = 5
 LAMBDA_GP = 10
-START_EPOCH = 0  # to resume, to start new use 0
+START_EPOCH = 0
 NUM_EPOCHS = 1001
 SAVE_INTERVAL = 5
 KEEP_LAST_CHECKPOINTS = 3
@@ -74,9 +70,7 @@ def save_spectrogram_image(gen_spec, epoch, batch_idx):
 
 
 def train():
-    print("Loading Text Encoder directly to GPU...")
     text_encoder = SentenceTransformer(TEXT_ENCODER_MODEL).to(device)
-    print("Initializing ESC-50 Dataset...")
     dataset = AudioTextDataset(
         csv_file=DUMMY_CSV_FILE, audio_dir=DUMMY_AUDIO_DIR,
         sample_rate=SAMPLE_RATE, n_fft=N_FFT, hop_length=HOP_LENGTH,
@@ -87,7 +81,6 @@ def train():
                         num_workers=16, pin_memory=True)
     gen = Generator(NOISE_DIM, TEXT_EMBEDDING_DIM, FEATURES_GEN).to(device)
     critic = Discriminator(TEXT_EMBEDDING_DIM, FEATURES_CRITIC).to(device)
-
     opt_gen = optim.Adam(gen.parameters(), lr=LEARNING_RATE, betas=(0.0, 0.9))
     opt_critic = optim.Adam(critic.parameters(), lr=LEARNING_RATE, betas=(0.0, 0.9))
 
@@ -112,11 +105,17 @@ def train():
             if real_spec is None: continue
             real_spec = real_spec.to(device)
             cur_batch_size = real_spec.shape[0]
+            if cur_batch_size < 2:
+                continue
+
             with torch.no_grad():
                 text_emb = text_encoder.encode(captions, convert_to_tensor=True).to(device)
+
             for _ in range(CRITIC_ITERATIONS):
                 noise = torch.randn(cur_batch_size, Z_DIM).to(device)
-                fake_spec = gen(noise, text_emb)
+
+                with torch.no_grad():
+                    fake_spec = gen(noise, text_emb)
 
                 critic_real = critic(real_spec, text_emb).reshape(-1)
                 critic_fake = critic(fake_spec, text_emb).reshape(-1)
@@ -125,18 +124,23 @@ def train():
                 loss_critic = (-(torch.mean(critic_real) - torch.mean(critic_fake)) + LAMBDA_GP * gp)
 
                 opt_critic.zero_grad()
-                loss_critic.backward(retain_graph=True)
+                loss_critic.backward()
                 opt_critic.step()
 
-            gen_fake = critic(fake_spec, text_emb).reshape(-1)
+            noise_gen = torch.randn(cur_batch_size, Z_DIM).to(device)# Generate a fresh batch of fake data specifically to pass gradients back to the generator
+            fake_spec_gen = gen(noise_gen, text_emb)
+
+            gen_fake = critic(fake_spec_gen, text_emb).reshape(-1)
             loss_gen = -torch.mean(gen_fake)
+
             opt_gen.zero_grad()
             loss_gen.backward()
             opt_gen.step()
 
             if batch_idx % 25 == 0:
                 print(
-                    f"Epoch [{epoch}/{NUM_EPOCHS}] Batch {batch_idx}/{len(loader)} \t Loss D: {loss_critic.item():.4f}, Loss G: {loss_gen.item():.4f}")
+                    f"Epoch [{epoch}/{NUM_EPOCHS}] Batch {batch_idx}/{len(loader)} \t Loss D: {loss_critic.item():.4f},"
+                    f" Loss G: {loss_gen.item():.4f}")
 
             if batch_idx == 0:
                 with torch.no_grad():

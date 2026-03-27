@@ -32,19 +32,18 @@ class SelfAttention(nn.Module):
 
 
 class GeneratorResBlock(nn.Module):
-    """Residual Block to prevent gradient vanishing and allow deeper texture learning."""
+    """Residual Block utilizing bilinear upsampling to prevent high-frequency checkerboard artifacts."""
 
     def __init__(self, in_channels, out_channels):
         super().__init__()
-        self.upsample = nn.Upsample(scale_factor=2, mode='nearest')
+        self.upsample = nn.Upsample(scale_factor=2, mode='bilinear', align_corners=False)
         self.conv1 = nn.Conv2d(in_channels, out_channels, 3, 1, 1)
         self.bn1 = nn.BatchNorm2d(out_channels)
         self.conv2 = nn.Conv2d(out_channels, out_channels, 3, 1, 1)
         self.bn2 = nn.BatchNorm2d(out_channels)
         self.shortcut = nn.Sequential(
-            nn.Upsample(scale_factor=2, mode='nearest'),
-            nn.Conv2d(in_channels, out_channels, 1, 1, 0)
-        )
+            nn.Upsample(scale_factor=2, mode='bilinear', align_corners=False),
+            nn.Conv2d(in_channels, out_channels, 1, 1, 0))
 
     def forward(self, x):
         res = self.shortcut(x)
@@ -64,9 +63,7 @@ class Generator(nn.Module):
         self.fc = nn.Sequential(
             nn.Linear(input_dim, self.h_dim * self.w_dim * self.initial_channels),
             nn.BatchNorm1d(self.h_dim * self.w_dim * self.initial_channels),
-            nn.ReLU(True)
-        )
-
+            nn.ReLU(True))
         self.res1 = GeneratorResBlock(base_channels, base_channels // 2)
         self.attn = SelfAttention(base_channels // 2)
         self.res2 = GeneratorResBlock(base_channels // 2, base_channels // 4)
@@ -75,8 +72,7 @@ class Generator(nn.Module):
 
         self.final_conv = nn.Sequential(
             nn.Conv2d(base_channels // 16, 1, kernel_size=3, stride=1, padding=1),
-            nn.Tanh()
-        )
+            nn.Tanh())
 
     def forward(self, noise, text_embedding):
         x = torch.cat((noise, text_embedding), dim=1)
@@ -97,29 +93,23 @@ class Generator(nn.Module):
 class Discriminator(nn.Module):
     def __init__(self, text_dim=TEXT_EMBEDDING_DIM, base_channels=64):
         super().__init__()
-
         self.conv1 = nn.Sequential(
             spectral_norm(nn.Conv2d(1, base_channels, 4, 2, 1)),
-            nn.LeakyReLU(0.2, inplace=True)
-        )
+            nn.LeakyReLU(0.2, inplace=True))
         self.conv2 = nn.Sequential(
             spectral_norm(nn.Conv2d(base_channels, base_channels * 2, 4, 2, 1)),
-            nn.LeakyReLU(0.2, inplace=True)
-        )
+            nn.LeakyReLU(0.2, inplace=True))
         self.conv3 = nn.Sequential(
             spectral_norm(nn.Conv2d(base_channels * 2, base_channels * 4, 4, 2, 1)),
-            nn.LeakyReLU(0.2, inplace=True)
-        )
+            nn.LeakyReLU(0.2, inplace=True))
         self.attn = SelfAttention(base_channels * 4)
 
         self.conv4 = nn.Sequential(
             spectral_norm(nn.Conv2d(base_channels * 4, base_channels * 8, 4, 2, 1)),
-            nn.LeakyReLU(0.2, inplace=True)
-        )
+            nn.LeakyReLU(0.2, inplace=True))
         self.conv5 = nn.Sequential(
             spectral_norm(nn.Conv2d(base_channels * 8, base_channels * 16, 4, 2, 1)),
-            nn.LeakyReLU(0.2, inplace=True)
-        )
+            nn.LeakyReLU(0.2, inplace=True))
 
         self.flattened_size = (base_channels * 16) * 3 * 16
 
@@ -127,8 +117,7 @@ class Discriminator(nn.Module):
             spectral_norm(nn.Linear(self.flattened_size + text_dim, 512)),
             nn.LeakyReLU(0.2, inplace=True),
             nn.Dropout(0.3),
-            spectral_norm(nn.Linear(512, 1))
-        )
+            spectral_norm(nn.Linear(512, 1)))
 
     def forward(self, spectrogram, text_embedding):
         x = self.conv1(spectrogram)
