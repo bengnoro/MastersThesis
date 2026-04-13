@@ -12,25 +12,21 @@ try:
 except ImportError:
     print("Please install transformers: pip install transformers")
 
-# --- Explicit STFT Parameters ---
-SAMPLE_RATE = 22050  # Native DCASE sample rate
+
+SAMPLE_RATE = 22050
 N_FFT = 1024
 HOP_LENGTH = 256
 N_MELS = 80
 TARGET_TIME_STEPS = 512
 CENTER = True
 F_MIN = 0.0
-F_MAX = 8000.0  # SCIENTIFIC FIX: BigVGAN specific frequency cutoff
-
-# --- Statistical Normalization Constants ---
-DATASET_MEAN = -19.91  # UPDATE THESE AFTER RUNNING datasetStats.py
+F_MAX = 8000.0
+DATASET_MEAN = -19.91
 DATASET_STD = 21.04
 
-# --- CLAP Text Encoder ---
 TEXT_ENCODER_MODEL = 'laion/clap-htsat-unfused'
 EMBEDDING_DIM = 512
 
-# Explicitly mapping to DCASE paths
 DUMMY_AUDIO_DIR = "/srv/large-data/hasan4/sounds/DCASE2023_Task7/DCASE_2023_Challenge_Task_7_Dataset/dev"
 DUMMY_CSV_FILE = "/srv/large-data/hasan4/sounds/DCASE2023_Task7/DCASE_2023_Challenge_Task_7_Dataset/DevMeta.csv"
 
