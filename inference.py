@@ -3,105 +3,78 @@ import torchaudio
 import os
 import warnings
 
-try:
-    import bigvgan
-except ImportError:
-    print("Please install NVIDIA BigVGAN: `pip install bigvgan`")
-    exit()
-
 os.environ["HF_HUB_DISABLE_SYMLINKS_WARNING"] = "1"
 warnings.filterwarnings("ignore", category=FutureWarning)
-
+from sentence_transformers import SentenceTransformer
+from vocos import Vocos
 from models import Generator, NOISE_DIM
-from data_pipeline import (
-    TEXT_ENCODER_MODEL, EMBEDDING_DIM, SAMPLE_RATE,
-    ClapTextEncoder, DATASET_MEAN, DATASET_STD
-)
+from data_pipeline import TEXT_ENCODER_MODEL, EMBEDDING_DIM, SAMPLE_RATE
 
-CHECKPOINT_PATH = "checkpoints/gen_epoch_1000.pth.tar"
-OUTPUT_FOLDER = "generated_samples_bigvgan"
+# config
+CHECKPOINT_PATH = "checkpoints/gen_epoch_795.pth.tar"
+OUTPUT_FOLDER = "generated_samples_vocos"
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-FEATURES_GEN = 512
+FEATURES_GEN = 1024
 
 
-def get_bigvgan_pipeline():
-    print("Loading NVIDIA BigVGAN v2 (22kHz, 80 Band)...")
-    vocoder = bigvgan.BigVGAN.from_pretrained('nvidia/bigvgan_v2_22khz_80band_256x', use_cuda_kernel=False).to(DEVICE)
-    vocoder.remove_weight_norm()
-    vocoder.eval()
-    return vocoder
-
-
-def denormalize_to_log_amplitude(spectrogram):
+def denormalize(spectrogram):
     """
-    1. Reverses Z-score back to Decibels (dB)
-    2. Converts dB back to physical amplitude
-    3. Translates amplitude to natural log space expected by BigVGAN
+    Converts GAN output range [-1, 1] back to the true decibel range [-80, 0]
+    expected by the Vocos neural decoder.
     """
-    S_db = (spectrogram * (3.0 * DATASET_STD)) + DATASET_MEAN
-    S_amp = 10.0 ** (S_db / 20.0)
-    S_log = torch.log(torch.clamp(S_amp, min=1e-5))
-    return S_log
+    S = (spectrogram + 1.0) / 2.0
+    S = S * 80.0
+    S = S - 80.0
+    return S
 
 
 def generate_sound(text_prompt, generator, text_encoder, vocoder):
-    print(f"Generating BigVGAN sound for: '{text_prompt}'...")
-
+    print(f"Generating high-fidelity sound for: '{text_prompt}'...")
     with torch.no_grad():
-        formatted_prompt = f"The sound of {text_prompt.lower()}."
-        text_emb = text_encoder.encode(formatted_prompt, convert_to_tensor=True).to(DEVICE)
+        text_emb = text_encoder.encode(text_prompt, convert_to_tensor=True).to(DEVICE)
+        text_emb = text_emb.unsqueeze(0)
         noise = torch.randn(1, NOISE_DIM).to(DEVICE)
-
         generator.eval()
         generated_spec = generator(noise, text_emb)
 
-        S_log = denormalize_to_log_amplitude(generated_spec.squeeze(1))
-        audio_waveform = vocoder(S_log).squeeze(1)
+        S_db = denormalize(generated_spec.squeeze(1))  # Denormalize to standard log-mel format
+        audio_waveform = vocoder.decode(S_db)
         max_val = torch.max(torch.abs(audio_waveform))
         if max_val > 0:
             audio_waveform = audio_waveform / max_val
-
         return audio_waveform.cpu()
 
 
 def main():
     os.makedirs(OUTPUT_FOLDER, exist_ok=True)
-
-    print("Loading CLAP")
-    text_encoder = ClapTextEncoder(TEXT_ENCODER_MODEL, device=DEVICE)
-
-    print("Loading SA-ResGAN")
+    print("Loading Text Encoder")
+    text_encoder = SentenceTransformer(TEXT_ENCODER_MODEL).to(DEVICE)
+    print("Loading SA-ResGAN Generator...")
     gen = Generator(noise_dim=NOISE_DIM, text_dim=EMBEDDING_DIM, base_channels=FEATURES_GEN).to(DEVICE)
 
     if os.path.exists(CHECKPOINT_PATH):
         checkpoint = torch.load(CHECKPOINT_PATH, map_location=DEVICE, weights_only=True)
         gen.load_state_dict(checkpoint["state_dict"])
     else:
-        print(f"Warning: Checkpoint {CHECKPOINT_PATH} not found. Generator output will be random noise.")
+        print(f"Warning: Checkpoint {CHECKPOINT_PATH} not found. Ensure you train the new architecture first.")
+        return
 
     gen.eval()
 
-    vocoder = get_bigvgan_pipeline()
+    print("Loading SOTA Vocos Universal Decoder...")
+    vocoder = Vocos.from_pretrained("charactr/vocos-mel-24khz").to(DEVICE)
 
     test_prompts = [
-        "footstep",
-        "keyboard",
-        "dog bark",
-        "gunshot",
-        "moving motor vehicle",
-        "rain",
-        "sneeze"
+        "footsteps",
+        "door wood knock",
+        "glass breaking"
     ]
 
     for i, prompt in enumerate(test_prompts):
         waveform = generate_sound(prompt, gen, text_encoder, vocoder)
+        torchaudio.save(os.path.join(OUTPUT_FOLDER, f"sample_{i}.wav"), waveform.unsqueeze(0), SAMPLE_RATE)
 
-        if waveform.dim() == 1:
-            waveform = waveform.unsqueeze(0)
-
-        torchaudio.save(os.path.join(OUTPUT_FOLDER, f"sample_{i}_bigvgan.wav"), waveform, SAMPLE_RATE)
-
-    print(f"\ngeneration complete in the'{OUTPUT_FOLDER}' folder.")
+    print(f"\nGeneration complete. Check the '{OUTPUT_FOLDER}' folder.")
 
 
 if __name__ == "__main__":
