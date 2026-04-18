@@ -55,13 +55,8 @@ def generate_sound(text_prompt, generator, text_encoder, vocoder):
         generator.eval()
         generated_spec = generator(noise, text_emb)
 
-        # Convert GAN output directly into BigVGAN log-mel format
         S_log = denormalize_to_log_amplitude(generated_spec.squeeze(1))
-
-        # Neural vocoder synthesis
         audio_waveform = vocoder(S_log).squeeze(1)
-
-        # Normalize waveform peak output to prevent clipping
         max_val = torch.max(torch.abs(audio_waveform))
         if max_val > 0:
             audio_waveform = audio_waveform / max_val
@@ -88,7 +83,6 @@ def main():
 
     vocoder = get_bigvgan_pipeline()
 
-    # Updated prompts to align with DCASE classes
     test_prompts = [
         "footstep",
         "keyboard",

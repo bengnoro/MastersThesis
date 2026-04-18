@@ -12,7 +12,6 @@ try:
 except ImportError:
     print("Please install transformers: pip install transformers")
 
-
 SAMPLE_RATE = 22050
 N_FFT = 1024
 HOP_LENGTH = 256
@@ -21,9 +20,9 @@ TARGET_TIME_STEPS = 512
 CENTER = True
 F_MIN = 0.0
 F_MAX = 8000.0
+# from test dataset stats
 DATASET_MEAN = -19.91
 DATASET_STD = 21.04
-
 TEXT_ENCODER_MODEL = 'laion/clap-htsat-unfused'
 EMBEDDING_DIM = 512
 

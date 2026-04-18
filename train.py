@@ -22,43 +22,22 @@ from data_pipeline import (
 )
 from models import Generator, Discriminator, initialize_weights, NOISE_DIM
 
-# Hyperparameters
-LEARNING_RATE = 1e-4
+# hyperparameters
+LEARNING_RATE_GEN = 5e-5
+LEARNING_RATE_CRITIC = 2e-5
 BATCH_SIZE = 12
 Z_DIM = NOISE_DIM
 FEATURES_CRITIC = 128
 FEATURES_GEN = 256
-CRITIC_ITERATIONS = 5
-LAMBDA_GP = 10.0
-LAMBDA_FM = 1.0
-START_EPOCH = 0
+CRITIC_ITERATIONS = 2
+LAMBDA_FM = 0.1
+START_EPOCH = 320
 NUM_EPOCHS = 1001
 SAVE_INTERVAL = 5
 KEEP_LAST_CHECKPOINTS = 3
 
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-
-
-def compute_gradient_penalty(critic, real_data, fake_data, text_embeddings, device):
-    cur_batch_size = real_data.shape[0]
-    epsilon = torch.rand((cur_batch_size, 1, 1, 1)).to(device)
-
-    interpolated = (epsilon * real_data + ((1 - epsilon) * fake_data)).requires_grad_(True)
-
-    with torch.cuda.amp.autocast(enabled=False):
-        critic_interpolated, _ = critic(interpolated.float(), text_embeddings.float())
-
-        gradients = torch.autograd.grad(
-            inputs=interpolated, outputs=critic_interpolated,
-            grad_outputs=torch.ones_like(critic_interpolated),
-            create_graph=True, retain_graph=True,
-        )[0]
-
-    gradients = gradients.view(gradients.shape[0], -1)
-
-    gradients_norm = torch.sqrt(torch.sum(gradients ** 2, dim=1) + 1e-12)
-    gradient_penalty = torch.mean((gradients_norm - 1) ** 2)
-    return gradient_penalty
+torch.backends.cudnn.benchmark = True
 
 
 def cleanup_old_checkpoints(current_epoch):
@@ -72,7 +51,6 @@ def cleanup_old_checkpoints(current_epoch):
 def save_spectrogram_image(gen_spec, epoch, batch_idx):
     os.makedirs("training_logs", exist_ok=True)
 
-    # enforce clamp here for plotting since we removed Tanh
     spec_cpu = torch.clamp(gen_spec[0].squeeze().detach().cpu().float(), min=-1.0, max=1.0).numpy()
 
     spec_db = (spec_cpu * (3.0 * DATASET_STD)) + DATASET_MEAN
@@ -91,7 +69,7 @@ def save_spectrogram_image(gen_spec, epoch, batch_idx):
 def plot_and_save_losses(g_losses, d_losses):
     plt.figure(figsize=(12, 6))
     plt.plot(g_losses, label="Generator Loss", color="blue", alpha=0.8)
-    plt.plot(d_losses, label="Critic Loss (Wasserstein)", color="red", alpha=0.8)
+    plt.plot(d_losses, label="Critic Loss (Hinge)", color="red", alpha=0.8)
     plt.title("GAN Training Loss over Time")
     plt.xlabel("Training Iterations")
     plt.ylabel("Loss")
@@ -140,8 +118,8 @@ def train():
     loader = DataLoader(dataset, batch_size=BATCH_SIZE, shuffle=True, collate_fn=collate_fn, drop_last=True,
                         num_workers=8, pin_memory=True)
 
-    opt_gen = optim.Adam(gen.parameters(), lr=LEARNING_RATE, betas=(0.5, 0.9), eps=1e-4)
-    opt_critic = optim.Adam(critic.parameters(), lr=LEARNING_RATE, betas=(0.5, 0.9), eps=1e-4)
+    opt_gen = optim.Adam(gen.parameters(), lr=LEARNING_RATE_GEN, betas=(0.5, 0.9), eps=1e-4)
+    opt_critic = optim.Adam(critic.parameters(), lr=LEARNING_RATE_CRITIC, betas=(0.5, 0.9), eps=1e-4)
 
     scaler_gen = torch.cuda.amp.GradScaler()
     scaler_critic = torch.cuda.amp.GradScaler()
@@ -163,29 +141,29 @@ def train():
     if START_EPOCH > 0:
         print(f"Resuming training from Epoch {START_EPOCH}...")
         ckpt_gen = torch.load(f"checkpoints/gen_epoch_{START_EPOCH}.pth.tar", map_location=device, weights_only=True)
-        gen.load_state_dict(ckpt_gen["state_dict"])
+
+        gen_state = ckpt_gen["state_dict"]
+        if "final_conv.conv.weight" in gen_state:
+            gen_state["final_conv.0.conv.weight"] = gen_state.pop("final_conv.conv.weight")
+        if "final_conv.conv.bias" in gen_state:
+            gen_state["final_conv.0.conv.bias"] = gen_state.pop("final_conv.conv.bias")
+        gen.load_state_dict(gen_state)
         opt_gen.load_state_dict(ckpt_gen["optimizer"])
         if "scheduler" in ckpt_gen:
             scheduler_gen.load_state_dict(ckpt_gen["scheduler"])
-
-        ckpt_critic = torch.load(f"checkpoints/critic_epoch_{START_EPOCH}.pth.tar", map_location=device,
-                                 weights_only=True)
-        critic.load_state_dict(ckpt_critic["state_dict"])
-        opt_critic.load_state_dict(ckpt_critic["optimizer"])
-        if "scheduler" in ckpt_critic:
-            scheduler_critic.load_state_dict(ckpt_critic["scheduler"])
     else:
         initialize_weights(gen)
         initialize_weights(critic)
 
     fixed_noise = torch.randn(1, Z_DIM).to(device)
-    #  Text embedding normalization removed to allow full magnitude variance for the projection
     fixed_text_emb = text_encoder.encode(["footsteps"], convert_to_tensor=True).to(device).clone()
 
     print("\nStarting SA-ResGAN Training...")
 
     try:
         for epoch in range(START_EPOCH, NUM_EPOCHS):
+            noise_std = max(0.0, 0.1 * (1.0 - epoch / 500.0))
+
             for batch_idx, (real_spec, captions, precomputed_embs) in enumerate(loader):
                 if real_spec is None: continue
 
@@ -205,52 +183,72 @@ def train():
 
                 while True:
                     try:
-                        # 1. Train the Critic
-                        last_real_features = None
                         for step in range(CRITIC_ITERATIONS):
                             noise = torch.randn(cur_batch_size, Z_DIM).to(device)
 
                             with torch.no_grad():
                                 with torch.cuda.amp.autocast():
-                                    fake_spec = gen(noise, text_emb)
+                                    fake_spec = gen(noise, text_emb).detach()
 
                             opt_critic.zero_grad(set_to_none=True)
 
                             with torch.cuda.amp.autocast():
-                                critic_real, real_features = critic(real_spec, text_emb)
-                                critic_fake, _ = critic(fake_spec, text_emb)
+                                real_spec_noisy = real_spec + torch.randn_like(real_spec) * noise_std
+                                fake_spec_noisy = fake_spec + torch.randn_like(fake_spec) * noise_std
+
+                                critic_real, _ = critic(real_spec_noisy, text_emb)
+                                critic_fake, _ = critic(fake_spec_noisy, text_emb)
 
                                 critic_real = critic_real.reshape(-1)
                                 critic_fake = critic_fake.reshape(-1)
 
-                            gp = compute_gradient_penalty(critic, real_spec, fake_spec, text_emb, device)
-                            loss_critic = (-(torch.mean(critic_real.float()) - torch.mean(
-                                critic_fake.float())) + LAMBDA_GP * gp)
+                                loss_critic = torch.mean(F.relu(1.0 - critic_real.float())) + torch.mean(
+                                    F.relu(1.0 + critic_fake.float()))
+
+                            if torch.isnan(loss_critic) or torch.isinf(loss_critic):
+                                print(
+                                    f"Detected NaN/Inf in Critic Loss at Epoch {epoch}, Batch {batch_idx}. Skipping batch.")
+                                opt_gen.zero_grad(set_to_none=True)
+                                opt_critic.zero_grad(set_to_none=True)
+                                raise ValueError("Loss Explosion")
 
                             scaler_critic.scale(loss_critic).backward()
+                            scaler_critic.unscale_(opt_critic)
+                            torch.nn.utils.clip_grad_norm_(critic.parameters(), max_norm=10.0)
                             scaler_critic.step(opt_critic)
                             scaler_critic.update()
 
-                            if step == CRITIC_ITERATIONS - 1:
-                                last_real_features = [f.detach() for f in real_features]
-
-                        # 2. Train the Generator
                         noise = torch.randn(cur_batch_size, Z_DIM).to(device)
                         opt_gen.zero_grad(set_to_none=True)
 
                         with torch.cuda.amp.autocast():
                             fake_spec = gen(noise, text_emb)
-                            critic_fake_out, fake_features = critic(fake_spec, text_emb)
 
-                        loss_gen_adv = -torch.mean(critic_fake_out.float().reshape(-1))
+                            real_spec_noisy = real_spec + torch.randn_like(real_spec) * noise_std
+                            fake_spec_noisy = fake_spec + torch.randn_like(fake_spec) * noise_std
 
-                        loss_fm = 0.0
-                        for f_real, f_fake in zip(last_real_features, fake_features):
-                            loss_fm += F.l1_loss(f_fake.float(), f_real.float())
+                            with torch.no_grad():
+                                _, real_features_fresh = critic(real_spec_noisy, text_emb)
 
-                        loss_gen = loss_gen_adv + (LAMBDA_FM * loss_fm)
+                            critic_fake_out, fake_features = critic(fake_spec_noisy, text_emb)
+
+                            loss_gen_adv = -torch.mean(critic_fake_out.float().reshape(-1))
+
+                            loss_fm = 0.0
+                            for f_real, f_fake in zip(real_features_fresh, fake_features):
+                                loss_fm += F.l1_loss(f_fake.float(), f_real.float())
+
+                            loss_gen = loss_gen_adv + (LAMBDA_FM * loss_fm)
+
+                        if torch.isnan(loss_gen) or torch.isinf(loss_gen):
+                            print(f"Detected NaN/Inf in Gen Loss at Epoch {epoch}, Batch {batch_idx}. Skipping batch.")
+                            opt_gen.zero_grad(set_to_none=True)
+                            opt_critic.zero_grad(set_to_none=True)
+                            raise ValueError("Loss Explosion")
 
                         scaler_gen.scale(loss_gen).backward()
+                        scaler_gen.unscale_(opt_gen)
+                        torch.nn.utils.clip_grad_norm_(gen.parameters(), max_norm=10.0)
                         scaler_gen.step(opt_gen)
                         scaler_gen.update()
 
@@ -271,15 +269,18 @@ def train():
 
                         break
 
+                    except ValueError:
+                        break
+
                     except Exception as e:
                         err_msg = str(e)
                         if "out of memory" in err_msg.lower():
                             print(
                                 f"\n[OOM ALERT] GPU Memory full. Waiting 60s to cleanly retry the exact same batch...")
                             del e
-                            noise = fake_spec = critic_real = critic_fake = gp = None
-                            loss_critic = critic_fake_out = fake_features = real_features = last_real_features = None
-                            loss_gen_adv = loss_fm = loss_gen = None
+                            noise = fake_spec = critic_real = critic_fake = None
+                            critic_fake_out = fake_features = real_features_fresh = None
+                            loss_critic = loss_gen_adv = loss_fm = loss_gen = None
                             opt_critic.zero_grad(set_to_none=True)
                             opt_gen.zero_grad(set_to_none=True)
                             gc.collect()

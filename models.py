@@ -14,7 +14,7 @@ NOISE_DIM = 100
 class CoordConv2d(nn.Module):
     def __init__(self, in_channels, out_channels, kernel_size=3, stride=1, padding=1):
         super().__init__()
-        self.conv = nn.Conv2d(in_channels + 2, out_channels, kernel_size, stride, padding)
+        self.conv = nn.Conv2d(in_channels + 2, out_channels, kernel_size, stride, padding, padding_mode='reflect')
 
     def forward(self, x):
         batch_size, _, h, w = x.shape
@@ -62,17 +62,13 @@ class SelfAttention(nn.Module):
         self.gamma = nn.Parameter(torch.zeros(1))
 
     def forward(self, x):
-        batch_size, C, width, height = x.size()
-        q = self.query(x).view(batch_size, -1, width * height).permute(0, 2, 1)
-        k = self.key(x).view(batch_size, -1, width * height)
-        v = self.value(x).view(batch_size, -1, width * height)
+        batch_size, C, h, w = x.size()
 
-        d = max(1, C // 8)
-        attention = torch.bmm(q, k) / math.sqrt(d)
-        attention = torch.softmax(attention, dim=-1)
-
-        out = torch.bmm(v, attention.permute(0, 2, 1))
-        out = out.view(batch_size, C, width, height)
+        q = self.query(x).view(batch_size, -1, h * w).permute(0, 2, 1)  # [B, N, C']
+        k = self.key(x).view(batch_size, -1, h * w).permute(0, 2, 1)  # [B, N, C']
+        v = self.value(x).view(batch_size, -1, h * w).permute(0, 2, 1)  # [B, N, C]
+        out = F.scaled_dot_product_attention(q, k, v)
+        out = out.permute(0, 2, 1).view(batch_size, C, h, w)
         return self.gamma * out + x
 
 
@@ -108,10 +104,12 @@ class ResBlockDown(nn.Module):
         super().__init__()
         self.model = nn.Sequential(
             nn.LeakyReLU(0.2),
-            spectral_norm(nn.Conv2d(in_channels, in_channels, kernel_size=3, stride=1, padding=1)),
+            spectral_norm(
+                nn.Conv2d(in_channels, in_channels, kernel_size=3, stride=1, padding=1, padding_mode='reflect')),
             nn.LeakyReLU(0.2),
             nn.AvgPool2d(2),
-            spectral_norm(nn.Conv2d(in_channels, out_channels, kernel_size=3, stride=1, padding=1))
+            spectral_norm(
+                nn.Conv2d(in_channels, out_channels, kernel_size=3, stride=1, padding=1, padding_mode='reflect'))
         )
         self.shortcut = nn.Sequential(
             nn.AvgPool2d(2),
@@ -153,7 +151,10 @@ class Generator(nn.Module):
         self.res5 = ResBlockUp(base_channels // 8, base_channels // 16)
 
         self.final_cgn = ConditionalGroupNorm2d(base_channels // 16)
-        self.final_conv = CoordConv2d(base_channels // 16, 1, kernel_size=3, stride=1, padding=1)
+        self.final_conv = nn.Sequential(
+            CoordConv2d(base_channels // 16, 1, kernel_size=3, stride=1, padding=1),
+            nn.Tanh()
+        )
 
     def forward(self, noise, text_embedding):
         cond = torch.cat((noise, text_embedding), dim=1)
@@ -181,7 +182,7 @@ class Discriminator(nn.Module):
         super().__init__()
 
         self.initial_conv = nn.Sequential(
-            spectral_norm(nn.Conv2d(1, base_channels, 3, 1, 1)),
+            spectral_norm(nn.Conv2d(1, base_channels, 3, 1, 1, padding_mode='reflect')),
             nn.LeakyReLU(0.2)
         )
 
@@ -231,7 +232,7 @@ class Discriminator(nn.Module):
         features.append(x)
 
         x = F.leaky_relu(x, 0.2)
-        flat_features = x.view(x.size(0), -1)
+        flat_features = x.reshape(x.size(0), -1)
 
         phi = self.feature_extractor(flat_features)
         out = self.final_linear(phi)
