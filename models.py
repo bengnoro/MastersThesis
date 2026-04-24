@@ -4,7 +4,7 @@ import torch.nn.functional as F
 from torch.nn.utils import spectral_norm
 import math
 
-# Config
+# Configuration
 N_MELS = 80
 TARGET_TIME_STEPS = 512
 TEXT_EMBEDDING_DIM = 512
@@ -64,10 +64,12 @@ class SelfAttention(nn.Module):
     def forward(self, x):
         batch_size, C, h, w = x.size()
 
-        q = self.query(x).view(batch_size, -1, h * w).permute(0, 2, 1)  # [B, N, C']
-        k = self.key(x).view(batch_size, -1, h * w).permute(0, 2, 1)  # [B, N, C']
-        v = self.value(x).view(batch_size, -1, h * w).permute(0, 2, 1)  # [B, N, C]
+        q = self.query(x).view(batch_size, -1, h * w).permute(0, 2, 1)
+        k = self.key(x).view(batch_size, -1, h * w).permute(0, 2, 1)
+        v = self.value(x).view(batch_size, -1, h * w).permute(0, 2, 1)
+
         out = F.scaled_dot_product_attention(q, k, v)
+
         out = out.permute(0, 2, 1).view(batch_size, C, h, w)
         return self.gamma * out + x
 
@@ -151,6 +153,7 @@ class Generator(nn.Module):
         self.res5 = ResBlockUp(base_channels // 8, base_channels // 16)
 
         self.final_cgn = ConditionalGroupNorm2d(base_channels // 16)
+
         self.final_conv = nn.Sequential(
             CoordConv2d(base_channels // 16, 1, kernel_size=3, stride=1, padding=1),
             nn.Tanh()
@@ -193,25 +196,12 @@ class Discriminator(nn.Module):
         self.res4 = ResBlockDown(base_channels * 8, base_channels * 16)
         self.res5 = ResBlockDown(base_channels * 16, base_channels * 16)
 
-        with torch.no_grad():
-            dummy_input = torch.zeros(1, 1, N_MELS, TARGET_TIME_STEPS)
-            x = self.initial_conv(dummy_input)
-            x = self.res1(x)
-            x = self.res2(x)
-            x = self.attn(x)
-            x = self.res3(x)
-            x = self.res4(x)
-            x = self.res5(x)
-            self.flattened_size = x.numel() // x.shape[0]
+        self.final_channels = base_channels * 16
 
-        self.feature_extractor = nn.Sequential(
-            spectral_norm(nn.Linear(self.flattened_size, 512)),
-            nn.LeakyReLU(0.2),
-            nn.Dropout(0.3)
-        )
-
-        self.final_linear = spectral_norm(nn.Linear(512, 1))
-        self.text_projection = spectral_norm(nn.Linear(text_dim, 512, bias=False))
+        # Corrected: PatchGAN scoring layer to preserve spatial gradients
+        self.final_conv = spectral_norm(nn.Conv2d(self.final_channels, 1, kernel_size=3, stride=1, padding=1))
+        # Corrected: Projection mapping for text conditioning directly matching feature depth
+        self.text_projection = spectral_norm(nn.Linear(text_dim, self.final_channels, bias=False))
 
     def forward(self, spectrogram, text_embedding):
         features = []
@@ -232,17 +222,22 @@ class Discriminator(nn.Module):
         features.append(x)
 
         x = F.leaky_relu(x, 0.2)
-        flat_features = x.reshape(x.size(0), -1)
 
-        phi = self.feature_extractor(flat_features)
-        out = self.final_linear(phi)
+        # Spatial Scoring
+        out = self.final_conv(x)  # Shape: (B, 1, H, W)
 
-        text_proj = self.text_projection(text_embedding)
-        projection_score = torch.sum(phi * text_proj, dim=1, keepdim=True)
+        # Spatial Text Projection (Miyato et al.)
+        text_proj = self.text_projection(text_embedding)  # Shape: (B, C)
+        text_proj = text_proj.view(text_proj.size(0), text_proj.size(1), 1, 1)  # Shape: (B, C, 1, 1)
 
-        out = out + projection_score
+        projection_score = torch.sum(x * text_proj, dim=1, keepdim=True)  # Shape: (B, 1, H, W)
 
-        return out, features
+        spatial_score = out + projection_score  # Shape: (B, 1, H, W)
+
+        # Final decision is the global average of the local spatial scores
+        final_score = torch.mean(spatial_score, dim=(2, 3))  # Shape: (B, 1)
+
+        return final_score, features
 
 
 def initialize_weights(m):

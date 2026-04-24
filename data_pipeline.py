@@ -4,8 +4,8 @@ import pandas as pd
 from torch.utils.data import Dataset, DataLoader
 import os
 import glob
-import re
 import warnings
+import random
 
 try:
     from transformers import AutoTokenizer, ClapTextModelWithProjection
@@ -20,14 +20,16 @@ TARGET_TIME_STEPS = 512
 CENTER = True
 F_MIN = 0.0
 F_MAX = 8000.0
-# from test dataset stats
+
 DATASET_MEAN = -19.91
 DATASET_STD = 21.04
+
 TEXT_ENCODER_MODEL = 'laion/clap-htsat-unfused'
 EMBEDDING_DIM = 512
 
-DUMMY_AUDIO_DIR = "/srv/large-data/hasan4/sounds/DCASE2023_Task7/DCASE_2023_Challenge_Task_7_Dataset/dev"
-DUMMY_CSV_FILE = "/srv/large-data/hasan4/sounds/DCASE2023_Task7/DCASE_2023_Challenge_Task_7_Dataset/DevMeta.csv"
+DUMMY_AUDIO_DIR = "/content/DCASE_2023_Challenge_Task_7_Dataset/dev"
+DUMMY_CSV_FILE = "/content/DCASE_2023_Challenge_Task_7_Dataset/DevMeta.csv"
+TARGET_WAVE_LENGTH = TARGET_TIME_STEPS * HOP_LENGTH
 
 
 class ClapTextEncoder:
@@ -39,13 +41,9 @@ class ClapTextEncoder:
         self.model.eval()
 
     def encode(self, texts, convert_to_tensor=True):
-        if isinstance(texts, str):
-            texts = [texts]
-
+        if isinstance(texts, str): texts = [texts]
         inputs = self.tokenizer(texts, padding=True, truncation=True, return_tensors="pt").to(self.device)
-        with torch.no_grad():
-            outputs = self.model(**inputs)
-
+        with torch.no_grad(): outputs = self.model(**inputs)
         return outputs.text_embeds
 
 
@@ -57,36 +55,47 @@ class AudioTextDataset(Dataset):
         self.target_time_steps = target_time_steps
 
         if not os.path.exists(csv_file):
-            print(f"Warning: Exact CSV path not found. Searching dynamically in {audio_dir}...")
-            search_path = os.path.join(audio_dir, '**', '*.csv')
-            found_csvs = glob.glob(search_path, recursive=True)
+            raise FileNotFoundError(f"Missing CSV at {csv_file}. Make sure you copied it to the NVMe.")
 
-            metadata_csvs = [f for f in found_csvs if 'metadata' in f.lower() or 'devmeta' in f.lower()]
-            if metadata_csvs:
-                csv_file = metadata_csvs[0]
-            elif found_csvs:
-                csv_file = found_csvs[0]
+        raw_df = pd.read_csv(csv_file)
+
+        print("Building high-speed I/O hash map in memory...")
+        all_wavs = glob.glob(os.path.join(self.audio_dir, '**', '*.wav'), recursive=True)
+        all_wavs += glob.glob(os.path.join(self.audio_dir, '**', '*.WAV'), recursive=True)
+
+        self.file_index = {}
+        for p in all_wavs:
+            parts = p.replace('\\', '/').split('/')
+            if len(parts) >= 2:
+                key = f"{parts[-2]}/{parts[-1]}".lower()
+                self.file_index[key] = p
+
+        print(f"Indexed {len(self.file_index)} unique physical audio files on disk.")
+
+        print("Purging missing files from the CSV metadata...")
+        valid_rows = []
+        for _, row in raw_df.iterrows():
+            file_str = str(row.get('current_file_path', row.get('filename', ''))).replace('\\', '/')
+            category = row.get('category', row.get('class', None))
+
+            if not file_str or pd.isna(category): continue
+
+            parts = file_str.split('/')
+            if len(parts) >= 2:
+                search_key = f"{parts[-2]}/{parts[-1]}".lower()
             else:
-                raise FileNotFoundError(f"Missing CSV: Could not locate any .csv files in {audio_dir}")
+                search_key = f"{category}/{parts[-1]}".lower()
 
-            print(f"Dynamically locked onto CSV: {csv_file}")
+            if search_key in self.file_index:
+                valid_rows.append(row)
 
-        self.captions_df = pd.read_csv(csv_file).reset_index(drop=True)
-        print(f"DCASE Dataset Loaded. Processing {len(self.captions_df)} high-fidelity samples.")
-
-        self.mel_spectrogram = torchaudio.transforms.MelSpectrogram(
-            sample_rate=sample_rate, n_fft=n_fft, hop_length=hop_length,
-            n_mels=n_mels, f_min=F_MIN, f_max=F_MAX, power=1.0, center=CENTER
-        )
-
-        self.amplitude_to_db = torchaudio.transforms.AmplitudeToDB(stype='amplitude', top_db=80.0)
+        self.captions_df = pd.DataFrame(valid_rows).reset_index(drop=True)
+        print(f"Dataset securely locked: {len(self.captions_df)} valid text-audio pairs ready for batching.")
 
         self.embedding_cache = {}
         if text_encoder is not None:
-            print("Pre-computing static text embeddings for ALL DCASE classes...")
-            cat_col = 'category' if 'category' in self.captions_df.columns else 'class' if 'class' in self.captions_df.columns else None
-
-            if cat_col:
+            cat_col = 'category' if 'category' in self.captions_df.columns else 'class'
+            if cat_col in self.captions_df.columns:
                 unique_classes = self.captions_df[cat_col].dropna().unique()
                 for cat in unique_classes:
                     raw_labels = str(cat).replace('_', ' ').lower()
@@ -94,114 +103,72 @@ class AudioTextDataset(Dataset):
                     emb = text_encoder.encode(caption, convert_to_tensor=True).cpu()
                     self.embedding_cache[cat] = emb
 
+        self.resampler_cache = {}
+
     def __len__(self):
         return len(self.captions_df)
 
-    def normalize_for_gan(self, S_db):
-        S_norm = (S_db - DATASET_MEAN) / (3.0 * DATASET_STD)
-        return torch.clamp(S_norm, min=-1.0, max=1.0)
-
     def __getitem__(self, idx):
-        try:
-            row = self.captions_df.iloc[idx]
+        # SCIENTIFIC FIX: Self-Healing Loop guarantees batch sizes never shrink
+        while True:
+            try:
+                row = self.captions_df.iloc[idx]
+                file_str = str(row.get('current_file_path', row.get('filename', ''))).replace('\\', '/')
+                category = row.get('category', row.get('class', None))
 
-            filename = row.get('filename', row.get('file', row.get('current_file_path', None)))
-            category = row.get('category', row.get('class', None))
-
-            if filename is None or category is None:
-                return None, None, None
-
-            base_filename = os.path.basename(str(filename))
-
-            audio_path = os.path.join(self.audio_dir, str(category), base_filename)
-            if not os.path.exists(audio_path):
-                audio_path = os.path.join(self.audio_dir, base_filename)
-                if not os.path.exists(audio_path):
-                    search_pattern = os.path.join(self.audio_dir, '**', base_filename)
-                    found_files = glob.glob(search_pattern, recursive=True)
-                    if found_files:
-                        audio_path = found_files[0]
-                    else:
-                        return None, None, None
-
-            waveform, original_sr = torchaudio.load(audio_path)
-
-            if original_sr != self.sample_rate:
-                waveform = torchaudio.transforms.Resample(original_sr, self.sample_rate)(waveform)
-
-            if waveform.shape[0] > 1:
-                waveform = torch.mean(waveform, dim=0, keepdim=True)
-
-            max_abs_val = torch.max(torch.abs(waveform))
-            if max_abs_val > 0: waveform = waveform / max_abs_val
-
-            if torch.rand(1).item() < 0.5:
-                gain = torch.empty(1).uniform_(0.5, 1.0).item()
-                waveform = waveform * gain
-
-            S_amp = self.mel_spectrogram(waveform)
-            S_db = self.amplitude_to_db(S_amp)
-            spectrogram = self.normalize_for_gan(S_db)
-
-            if spectrogram.dim() == 2:
-                spectrogram = spectrogram.unsqueeze(0)
-
-            n_time_steps = spectrogram.shape[2]
-
-            if n_time_steps < self.target_time_steps:
-                padding = self.target_time_steps - n_time_steps
-                pad_left = torch.randint(0, padding + 1, (1,)).item()
-                pad_right = padding - pad_left
-
-                if padding < n_time_steps:
-                    spectrogram = torch.nn.functional.pad(spectrogram, (pad_left, pad_right), mode='reflect')
+                parts = file_str.split('/')
+                if len(parts) >= 2:
+                    search_key = f"{parts[-2]}/{parts[-1]}".lower()
                 else:
-                    spectrogram = torch.nn.functional.pad(spectrogram, (pad_left, pad_right), mode='replicate')
+                    search_key = f"{category}/{parts[-1]}".lower()
 
-            elif n_time_steps > self.target_time_steps:
-                max_start = n_time_steps - self.target_time_steps
-                start_idx = torch.randint(0, max_start + 1, (1,)).item()
-                spectrogram = spectrogram[:, :, start_idx:start_idx + self.target_time_steps]
+                audio_path = self.file_index.get(search_key)
+                if audio_path is None:
+                    raise ValueError("File not found in index.")
 
-            raw_labels = str(category).replace('_', ' ').lower()
-            caption = f"The sound of {raw_labels}."
+                # If this fails (corrupt file), it drops to the except block
+                waveform, original_sr = torchaudio.load(audio_path)
 
-            emb = self.embedding_cache.get(category, None)
+                if original_sr != self.sample_rate:
+                    if original_sr not in self.resampler_cache:
+                        self.resampler_cache[original_sr] = torchaudio.transforms.Resample(original_sr,
+                                                                                           self.sample_rate)
+                    waveform = self.resampler_cache[original_sr](waveform)
 
-            return spectrogram, caption, emb
+                if waveform.shape[0] > 1:
+                    waveform = torch.mean(waveform, dim=0, keepdim=True)
 
-        except Exception:
-            return None, None, None
+                max_abs_val = torch.max(torch.abs(waveform))
+                if max_abs_val > 0: waveform = waveform / max_abs_val
+
+                if torch.rand(1).item() < 0.5:
+                    gain = torch.empty(1).uniform_(0.5, 1.0).item()
+                    waveform = waveform * gain
+
+                n_samples = waveform.shape[1]
+                if n_samples < TARGET_WAVE_LENGTH:
+                    padding = TARGET_WAVE_LENGTH - n_samples
+                    pad_left = torch.randint(0, padding + 1, (1,)).item()
+                    pad_right = padding - pad_left
+                    waveform = torch.nn.functional.pad(waveform, (pad_left, pad_right), mode='constant', value=0.0)
+                elif n_samples > TARGET_WAVE_LENGTH:
+                    max_start = n_samples - TARGET_WAVE_LENGTH
+                    start_idx = torch.randint(0, max_start + 1, (1,)).item()
+                    waveform = waveform[:, start_idx:start_idx + TARGET_WAVE_LENGTH]
+
+                raw_labels = str(category).replace('_', ' ').lower()
+                caption = f"The sound of {raw_labels}."
+                emb = self.embedding_cache.get(category, None)
+
+                return waveform, caption, emb
+
+            except Exception as e:
+                # Instant retry with a completely new random file
+                idx = random.randint(0, len(self.captions_df) - 1)
 
 
 def collate_fn(batch):
-    valid_batch = [item for item in batch if item[0] is not None]
-    if len(valid_batch) == 0: return None, None, None
-    spectrograms, captions, embs = zip(*valid_batch)
-
+    waveforms, captions, embs = zip(*batch)
     if embs[0] is not None:
-        return torch.stack(spectrograms), list(captions), torch.stack(embs).squeeze(1)
-    return torch.stack(spectrograms), list(captions), None
-
-
-if __name__ == "__main__":
-    print("Testing DCASE 2023 Data Pipeline...")
-    dataset = AudioTextDataset(
-        csv_file=DUMMY_CSV_FILE,
-        audio_dir=DUMMY_AUDIO_DIR,
-        sample_rate=SAMPLE_RATE,
-        n_fft=N_FFT,
-        hop_length=HOP_LENGTH,
-        n_mels=N_MELS,
-        target_time_steps=TARGET_TIME_STEPS
-    )
-
-    total_files = len(dataset)
-    print(f"\nTotal verified files loaded: {total_files}")
-
-    if total_files > 0:
-        spec, cap, emb = dataset[44]
-        print(f"Sample 44 Caption: '{cap}'")
-        if spec is not None:
-            print(f"Sample 44 Spectrogram Shape: {spec.shape}")
-            print(f"Sample 44 Value Range: [{spec.min():.2f}, {spec.max():.2f}]")
+        return torch.stack(waveforms), list(captions), torch.stack(embs).squeeze(1)
+    return torch.stack(waveforms), list(captions), None
