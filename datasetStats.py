@@ -6,7 +6,7 @@ import os
 
 from torchaudio.transforms import MelSpectrogram, AmplitudeToDB
 
-SAMPLE_RATE = 22050  # DCASE
+SAMPLE_RATE = 22050
 N_FFT = 1024
 HOP_LENGTH = 256
 N_MELS = 80
@@ -19,13 +19,16 @@ DUMMY_AUDIO_DIR = "/srv/large-data/hasan4/sounds/DCASE2023_Task7/DCASE_2023_Chal
 
 
 def calculate_stats(num_files=2000):
-    print(f"Calculating dB dataset statistics (mean and std) for up to {num_files} DCASE files...")
+    """
+    Computes the mean and standard deviation of decibel values across a subset of the audio dataset.
+    """
+    print(f"Scanning up to {num_files} files...")
 
     search_path = os.path.join(DUMMY_AUDIO_DIR, '**', '*.wav')
     files = glob.glob(search_path, recursive=True)[:num_files]
 
     if not files:
-        print(f"Error: No .wav files found in {DUMMY_AUDIO_DIR} or its subdirectories. Check your extraction path.")
+        print(f"Error: Directory is empty or path is incorrect ({DUMMY_AUDIO_DIR}).")
         return
 
     mel_transform = MelSpectrogram(
@@ -36,18 +39,18 @@ def calculate_stats(num_files=2000):
 
     all_db_values = []
 
-    for f in files:
+    for file_path in files:
         try:
-            wav, sr = torchaudio.load(f)
+            wav, sr = torchaudio.load(file_path)
             if sr != SAMPLE_RATE:
                 wav = torchaudio.transforms.Resample(sr, SAMPLE_RATE)(wav)
             if wav.shape[0] > 1:
                 wav = wav.mean(dim=0, keepdim=True)
 
-            S_amp = mel_transform(wav)
-            S_db = to_db(S_amp)
+            s_amp = mel_transform(wav)
+            s_db = to_db(s_amp)
 
-            all_db_values.append(S_db.flatten().numpy())
+            all_db_values.append(s_db.flatten().numpy())
         except Exception:
             pass
 
@@ -56,21 +59,21 @@ def calculate_stats(num_files=2000):
 
     global_db_array = np.concatenate(all_db_values)
 
-    mu = np.mean(global_db_array)
-    sigma = np.std(global_db_array)
+    mean_val = np.mean(global_db_array)
+    std_val = np.std(global_db_array)
 
     p1 = np.percentile(global_db_array, 1)
     p99 = np.percentile(global_db_array, 99)
 
-    print("\nGlobal Decibel (dB) Spectrogram Stats")
-    print(f"Mean (µ):              {mu:.2f} dB")
-    print(f"Standard Deviation (σ):{sigma:.2f} dB")
-    print(f"P1 (1st Percentile):   {p1:.2f} dB")
-    print(f"P99 (99th Percentile): {p99:.2f} dB")
-    print("-------------------------------------------------")
-    print(f"DATASET_MEAN = {mu:.2f}")
-    print(f"DATASET_STD = {sigma:.2f}")
+    print("\nDataset Decibel Statistics:")
+    print(f"Mean (µ):              {mean_val:.2f} dB")
+    print(f"Standard Deviation (σ):{std_val:.2f} dB")
+    print(f"1st Percentile:        {p1:.2f} dB")
+    print(f"99th Percentile:       {p99:.2f} dB")
+    print("\nSuggested updates for configuration:")
+    print(f"DATASET_MEAN = {mean_val:.2f}")
+    print(f"DATASET_STD = {std_val:.2f}")
 
 
 if __name__ == "__main__":
-    calculate_stats(2000)
+    calculate_stats(3400)

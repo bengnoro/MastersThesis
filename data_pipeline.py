@@ -10,7 +10,7 @@ import random
 try:
     from transformers import AutoTokenizer, ClapTextModelWithProjection
 except ImportError:
-    print("Please install transformers: pip install transformers")
+    print("Missing library: transformers. Please install it.")
 
 SAMPLE_RATE = 22050
 N_FFT = 1024
@@ -21,8 +21,8 @@ CENTER = True
 F_MIN = 0.0
 F_MAX = 8000.0
 
-DATASET_MEAN = -19.91
-DATASET_STD = 21.04
+DATASET_MEAN = -13.18
+DATASET_STD = 20.96
 
 TEXT_ENCODER_MODEL = 'laion/clap-htsat-unfused'
 EMBEDDING_DIM = 512
@@ -33,6 +33,10 @@ TARGET_WAVE_LENGTH = TARGET_TIME_STEPS * HOP_LENGTH
 
 
 class ClapTextEncoder:
+    """
+    Handles text tokenization and embedding generation using a pretrained CLAP model.
+    """
+
     def __init__(self, model_name=TEXT_ENCODER_MODEL, device="cpu"):
         warnings.filterwarnings("ignore", category=FutureWarning)
         self.tokenizer = AutoTokenizer.from_pretrained(model_name)
@@ -41,56 +45,60 @@ class ClapTextEncoder:
         self.model.eval()
 
     def encode(self, texts, convert_to_tensor=True):
-        if isinstance(texts, str): texts = [texts]
+        """
+        Converts raw text strings into numerical embeddings.
+        """
+        if isinstance(texts, str):
+            texts = [texts]
         inputs = self.tokenizer(texts, padding=True, truncation=True, return_tensors="pt").to(self.device)
-        with torch.no_grad(): outputs = self.model(**inputs)
+        with torch.no_grad():
+            outputs = self.model(**inputs)
         return outputs.text_embeds
 
 
 class AudioTextDataset(Dataset):
-    def __init__(self, csv_file, audio_dir, sample_rate, n_fft, hop_length, n_mels, target_time_steps,
-                 text_encoder=None):
+    """
+    Dataset loader for reading audio files and corresponding text captions.
+    """
+
+    def __init__(self, csv_file, audio_dir, sample_rate, n_fft, hop_length, n_mels, target_time_steps, text_encoder=None):
         self.audio_dir = audio_dir
         self.sample_rate = sample_rate
         self.target_time_steps = target_time_steps
 
         if not os.path.exists(csv_file):
-            raise FileNotFoundError(f"Missing CSV at {csv_file}. Make sure you copied it to the NVMe.")
+            raise FileNotFoundError(f"Missing CSV at {csv_file}.")
 
         raw_df = pd.read_csv(csv_file)
 
-        print("Building high-speed I/O hash map in memory...")
+        print("Building file index...")
         all_wavs = glob.glob(os.path.join(self.audio_dir, '**', '*.wav'), recursive=True)
         all_wavs += glob.glob(os.path.join(self.audio_dir, '**', '*.WAV'), recursive=True)
 
         self.file_index = {}
-        for p in all_wavs:
-            parts = p.replace('\\', '/').split('/')
+        for file_path in all_wavs:
+            parts = file_path.replace('\\', '/').split('/')
             if len(parts) >= 2:
                 key = f"{parts[-2]}/{parts[-1]}".lower()
-                self.file_index[key] = p
+                self.file_index[key] = file_path
 
-        print(f"Indexed {len(self.file_index)} unique physical audio files on disk.")
-
-        print("Purging missing files from the CSV metadata...")
+        print("Filtering missing files from metadata...")
         valid_rows = []
         for _, row in raw_df.iterrows():
             file_str = str(row.get('current_file_path', row.get('filename', ''))).replace('\\', '/')
             category = row.get('category', row.get('class', None))
 
-            if not file_str or pd.isna(category): continue
+            if not file_str or pd.isna(category):
+                continue
 
             parts = file_str.split('/')
-            if len(parts) >= 2:
-                search_key = f"{parts[-2]}/{parts[-1]}".lower()
-            else:
-                search_key = f"{category}/{parts[-1]}".lower()
+            search_key = f"{parts[-2]}/{parts[-1]}".lower() if len(parts) >= 2 else f"{category}/{parts[-1]}".lower()
 
             if search_key in self.file_index:
                 valid_rows.append(row)
 
         self.captions_df = pd.DataFrame(valid_rows).reset_index(drop=True)
-        print(f"Dataset securely locked: {len(self.captions_df)} valid text-audio pairs ready for batching.")
+        print(f"Dataset ready. Valid pairs loaded: {len(self.captions_df)}")
 
         self.embedding_cache = {}
         if text_encoder is not None:
@@ -106,10 +114,15 @@ class AudioTextDataset(Dataset):
         self.resampler_cache = {}
 
     def __len__(self):
+        """
+        Returns the total number of valid samples in the dataset.
+        """
         return len(self.captions_df)
 
     def __getitem__(self, idx):
-        # SCIENTIFIC FIX: Self-Healing Loop guarantees batch sizes never shrink
+        """
+        Retrieves an audio sample, standardizes its length, and fetches its text embedding.
+        """
         while True:
             try:
                 row = self.captions_df.iloc[idx]
@@ -117,29 +130,25 @@ class AudioTextDataset(Dataset):
                 category = row.get('category', row.get('class', None))
 
                 parts = file_str.split('/')
-                if len(parts) >= 2:
-                    search_key = f"{parts[-2]}/{parts[-1]}".lower()
-                else:
-                    search_key = f"{category}/{parts[-1]}".lower()
+                search_key = f"{parts[-2]}/{parts[-1]}".lower() if len(parts) >= 2 else f"{category}/{parts[-1]}".lower()
 
                 audio_path = self.file_index.get(search_key)
                 if audio_path is None:
                     raise ValueError("File not found in index.")
 
-                # If this fails (corrupt file), it drops to the except block
                 waveform, original_sr = torchaudio.load(audio_path)
 
                 if original_sr != self.sample_rate:
                     if original_sr not in self.resampler_cache:
-                        self.resampler_cache[original_sr] = torchaudio.transforms.Resample(original_sr,
-                                                                                           self.sample_rate)
+                        self.resampler_cache[original_sr] = torchaudio.transforms.Resample(original_sr, self.sample_rate)
                     waveform = self.resampler_cache[original_sr](waveform)
 
                 if waveform.shape[0] > 1:
                     waveform = torch.mean(waveform, dim=0, keepdim=True)
 
                 max_abs_val = torch.max(torch.abs(waveform))
-                if max_abs_val > 0: waveform = waveform / max_abs_val
+                if max_abs_val > 0:
+                    waveform = waveform / max_abs_val
 
                 if torch.rand(1).item() < 0.5:
                     gain = torch.empty(1).uniform_(0.5, 1.0).item()
@@ -162,12 +171,14 @@ class AudioTextDataset(Dataset):
 
                 return waveform, caption, emb
 
-            except Exception as e:
-                # Instant retry with a completely new random file
+            except Exception:
                 idx = random.randint(0, len(self.captions_df) - 1)
 
 
 def collate_fn(batch):
+    """
+    Groups individual samples into a batch for training.
+    """
     waveforms, captions, embs = zip(*batch)
     if embs[0] is not None:
         return torch.stack(waveforms), list(captions), torch.stack(embs).squeeze(1)
