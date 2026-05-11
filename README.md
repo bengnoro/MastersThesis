@@ -10,7 +10,7 @@ Originally developed for generating interactive game audio for visually impaired
 Clone the repository and install required dependencies. CLAP text encoder relies natively on the HuggingFace `transformers` library.
 
 ```bash
-git clone [https://github.com/bengnoro/MastersThesis.git](https://github.com/bengnoro/MastersThesis.git)
+git clone git clone https://github.com/bengnoro/MastersThesis.git
 cd MastersThesis
 pip install torch torchvision torchaudio librosa pandas numpy matplotlib transformers
 ```
